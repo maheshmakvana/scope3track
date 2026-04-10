@@ -21,6 +21,7 @@ from scope3track.exceptions import (
 from scope3track.advanced import (
     AuditLog,
     CancellationToken,
+    CarbonReductionScenarioModeller,
     EmissionCache,
     EmissionDiff,
     EmissionDriftDetector,
@@ -28,9 +29,16 @@ from scope3track.advanced import (
     EmissionProfiler,
     EmissionReportExporter,
     EmissionRule,
+    EmissionSpanEmitter,
     EmissionValidator,
     PIIScrubber,
     RateLimiter,
+    ReductionScenario,
+    SBTiAlignmentChecker,
+    SBTiAlignmentResult,
+    ScenarioModelResult,
+    SupplierEmissionRanker,
+    SupplierRank,
     abatch_calculate,
     batch_calculate,
     diff_entries,
@@ -38,7 +46,7 @@ from scope3track.advanced import (
     stream_entries,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = [
     # Core
     "EmissionCalculator",
@@ -55,7 +63,7 @@ __all__ = [
     "CalculationError",
     "ValidationError",
     "ReportError",
-    # Advanced
+    # Advanced — base
     "EmissionCache",
     "EmissionPipeline",
     "EmissionValidator",
@@ -73,4 +81,13 @@ __all__ = [
     "diff_entries",
     "AuditLog",
     "PIIScrubber",
+    # Advanced — expert
+    "SBTiAlignmentChecker",
+    "SBTiAlignmentResult",
+    "SupplierEmissionRanker",
+    "SupplierRank",
+    "CarbonReductionScenarioModeller",
+    "ReductionScenario",
+    "ScenarioModelResult",
+    "EmissionSpanEmitter",
 ]

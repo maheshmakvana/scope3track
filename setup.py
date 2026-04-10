@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="scope3track",
-    version="1.0.0",
+    version="1.0.1",
     author="",
     description="Carbon and Scope 3 emissions tracking for SMBs — GHG Protocol compliant calculations, supplier tracking, CSRD-ready reporting",
     long_description=long_description,

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TypeVar
 
-from scope3track.models import EmissionEntry, EmissionReport
+from scope3track.models import EmissionEntry, EmissionReport, EmissionScope, Scope3Category
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -89,8 +89,7 @@ class EmissionCache:
         import pickle
         with self._lock:
             with open(path, "wb") as f:
-                import pickle as pk
-                pk.dump(dict(self._store), f)
+                pickle.dump(dict(self._store), f)
 
     def load(self, path: str) -> None:
         import pickle
@@ -424,3 +423,509 @@ class PIIScrubber:
     @classmethod
     def scrub(cls, text: str) -> str:
         return cls._EMAIL.sub("[EMAIL]", text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPERT: SCIENCE-BASED TARGETS (SBTi) ALIGNMENT CHECKER
+# ─────────────────────────────────────────────────────────────────────────────
+
+# GHG Protocol standard reduction trajectories (% reduction per year from base year)
+_SBTI_PATHWAYS: Dict[str, Dict[str, Any]] = {
+    "1.5C":  {"annual_reduction_pct": 0.042, "description": "1.5°C pathway — 4.2% absolute reduction per year"},
+    "well_below_2C": {"annual_reduction_pct": 0.025, "description": "Well-below 2°C pathway — 2.5% absolute reduction per year"},
+    "2C":    {"annual_reduction_pct": 0.018, "description": "2°C pathway — 1.8% absolute reduction per year"},
+}
+
+_SCOPE3_MATERIAL_CATEGORIES: List[str] = [
+    "purchased_goods_services",
+    "capital_goods",
+    "use_of_sold_products",
+    "end_of_life_treatment",
+    "investments",
+]
+
+
+@dataclass
+class SBTiAlignmentResult:
+    """SBTi alignment assessment for a company's emission report."""
+    company_id: str
+    reporting_year: int
+    pathway: str
+    base_year: int
+    base_year_total_t_co2e: float
+    current_total_t_co2e: float
+    required_total_t_co2e: float
+    years_elapsed: int
+    on_track: bool
+    gap_t_co2e: float
+    scope3_coverage_pct: float
+    scope3_material: bool
+    recommendations: List[str]
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "company_id": self.company_id,
+            "reporting_year": self.reporting_year,
+            "pathway": self.pathway,
+            "on_track": self.on_track,
+            "current_t_co2e": round(self.current_total_t_co2e, 2),
+            "required_t_co2e": round(self.required_total_t_co2e, 2),
+            "gap_t_co2e": round(self.gap_t_co2e, 2),
+            "scope3_material": self.scope3_material,
+            "scope3_coverage_pct": round(self.scope3_coverage_pct, 1),
+        }
+
+
+class SBTiAlignmentChecker:
+    """
+    Assess whether a company's emissions trajectory aligns with SBTi pathways.
+
+    Computes the required total emissions for the current year based on a
+    base-year snapshot and the chosen decarbonization pathway (1.5°C,
+    well-below 2°C, or 2°C). Flags whether Scope 3 is material (>40% of total)
+    and therefore required under SBTi rules.
+
+    Usage::
+
+        checker = SBTiAlignmentChecker()
+        result = checker.check(
+            report=current_report,
+            base_year=2020,
+            base_year_total_t_co2e=12000.0,
+            pathway="1.5C",
+        )
+        print(checker.to_markdown(result))
+    """
+
+    PATHWAYS = list(_SBTI_PATHWAYS.keys())
+
+    def check(
+        self,
+        report: EmissionReport,
+        base_year: int,
+        base_year_total_t_co2e: float,
+        pathway: str = "1.5C",
+    ) -> SBTiAlignmentResult:
+        """Perform SBTi alignment check against a baseline."""
+        if pathway not in _SBTI_PATHWAYS:
+            raise ValueError(f"Unknown pathway '{pathway}'. Choose from {self.PATHWAYS}")
+
+        rate = _SBTI_PATHWAYS[pathway]["annual_reduction_pct"]
+        years = max(0, report.reporting_year - base_year)
+        required = base_year_total_t_co2e * ((1 - rate) ** years)
+        current = report.total_t_co2e
+        gap = current - required
+
+        # Scope 3 materiality: >40% of total means Scope 3 target is required
+        scope3_pct = (report.scope3_kg_co2e / report.total_kg_co2e * 100) if report.total_kg_co2e > 0 else 0.0
+        scope3_material = scope3_pct >= 40.0
+
+        # Scope 3 category coverage
+        covered_cats = set()
+        for e in report.entries:
+            if e.scope == EmissionScope.SCOPE3 and e.category:
+                covered_cats.add(e.category.value)
+        coverage_pct = (len(covered_cats) / 15 * 100) if covered_cats else 0.0
+
+        recs: List[str] = []
+        if not report.on_track if hasattr(report, "on_track") else gap > 0:
+            recs.append(f"Reduce total emissions by {round(gap, 1)} t CO2e to align with {pathway} pathway.")
+        if scope3_material and coverage_pct < 67:
+            recs.append("SBTi requires Scope 3 targets when material. Expand Scope 3 data collection to cover ≥2/3 of categories.")
+        if report.scope1_kg_co2e / 1000 > required * 0.5:
+            recs.append("Scope 1 represents >50% of target budget. Prioritise operational decarbonisation (fuel switching, electrification).")
+        if not recs:
+            recs.append(f"On track for {pathway} pathway. Maintain reduction momentum.")
+
+        return SBTiAlignmentResult(
+            company_id=report.company_id,
+            reporting_year=report.reporting_year,
+            pathway=pathway,
+            base_year=base_year,
+            base_year_total_t_co2e=base_year_total_t_co2e,
+            current_total_t_co2e=current,
+            required_total_t_co2e=required,
+            years_elapsed=years,
+            on_track=gap <= 0,
+            gap_t_co2e=gap,
+            scope3_coverage_pct=coverage_pct,
+            scope3_material=scope3_material,
+            recommendations=recs,
+        )
+
+    def multi_pathway_comparison(
+        self,
+        report: EmissionReport,
+        base_year: int,
+        base_year_total_t_co2e: float,
+    ) -> List[Dict[str, Any]]:
+        """Compare alignment across all three SBTi pathways."""
+        return [self.check(report, base_year, base_year_total_t_co2e, pw).summary() for pw in self.PATHWAYS]
+
+    def to_markdown(self, result: SBTiAlignmentResult) -> str:
+        """Render a Markdown SBTi alignment report."""
+        status = "ON TRACK" if result.on_track else "OFF TRACK"
+        lines = [
+            f"# SBTi Alignment Report — {result.company_id} ({result.reporting_year})",
+            f"**Pathway**: {result.pathway}  |  **Status**: {status}",
+            "",
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| Base Year | {result.base_year} |",
+            f"| Base Year Total | {result.base_year_total_t_co2e:.1f} t CO2e |",
+            f"| Current Total | {result.current_total_t_co2e:.2f} t CO2e |",
+            f"| Required Total | {result.required_total_t_co2e:.2f} t CO2e |",
+            f"| Gap | {result.gap_t_co2e:+.2f} t CO2e |",
+            f"| Scope 3 Material | {'Yes (target required)' if result.scope3_material else 'No'} |",
+            f"| Scope 3 Coverage | {result.scope3_coverage_pct:.1f}% of GHG Protocol categories |",
+            "",
+            "## Recommendations",
+        ]
+        for rec in result.recommendations:
+            lines.append(f"- {rec}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPERT: SUPPLIER EMISSION RANKER
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SupplierRank:
+    """Supplier emission rank with intensity and engagement priority."""
+    rank: int
+    supplier_id: str
+    total_kg_co2e: float
+    entry_count: int
+    avg_emission_intensity: float   # kg CO2e per activity unit
+    verified: bool
+    share_of_total_pct: float
+    engagement_priority: str        # "critical", "high", "medium", "low"
+    action: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rank": self.rank,
+            "supplier_id": self.supplier_id,
+            "total_kg_co2e": round(self.total_kg_co2e, 3),
+            "entry_count": self.entry_count,
+            "avg_emission_intensity": round(self.avg_emission_intensity, 6),
+            "verified": self.verified,
+            "share_of_total_pct": round(self.share_of_total_pct, 2),
+            "engagement_priority": self.engagement_priority,
+            "action": self.action,
+        }
+
+
+class SupplierEmissionRanker:
+    """
+    Rank Scope 3 suppliers by emission contribution and engagement priority.
+
+    Implements a Pareto-style analysis: identifies the top suppliers that
+    account for the largest share of Scope 3 emissions, flags unverified
+    suppliers, and assigns data collection engagement priorities.
+
+    Usage::
+
+        ranker = SupplierEmissionRanker()
+        rankings = ranker.rank(report)
+        print(ranker.to_markdown(rankings))
+    """
+
+    def rank(self, report: EmissionReport) -> List[SupplierRank]:
+        """Rank all suppliers in the report by total Scope 3 contribution."""
+        if not report.suppliers:
+            # Fall back to aggregating entries by supplier_id field
+            return self._rank_from_entries(report)
+
+        total_kg = report.scope3_kg_co2e or 1.0
+        ranked = []
+        sorted_suppliers = sorted(report.suppliers, key=lambda s: s.total_kg_co2e, reverse=True)
+
+        for i, supplier in enumerate(sorted_suppliers, 1):
+            share = supplier.total_kg_co2e / total_kg * 100
+            avg_intensity = 0.0
+            if supplier.entries:
+                intensities = [
+                    e.emissions_kg_co2e / e.activity_amount
+                    for e in supplier.entries if e.activity_amount > 0
+                ]
+                avg_intensity = sum(intensities) / len(intensities) if intensities else 0.0
+
+            if share >= 20:
+                priority, action = "critical", "Mandate verified primary data submission within 60 days."
+            elif share >= 10:
+                priority, action = "high", "Request carbon footprint disclosure and reduction roadmap."
+            elif share >= 5:
+                priority, action = "medium", "Include in annual Scope 3 data collection campaign."
+            else:
+                priority, action = "low", "Use spend-based estimation; revisit if spend increases."
+
+            if not supplier.verified:
+                priority = "critical" if priority in ("low", "medium") else priority
+                action = "Unverified data — prioritise verification before reporting. " + action
+
+            ranked.append(SupplierRank(
+                rank=i,
+                supplier_id=supplier.supplier_id,
+                total_kg_co2e=supplier.total_kg_co2e,
+                entry_count=len(supplier.entries),
+                avg_emission_intensity=avg_intensity,
+                verified=supplier.verified,
+                share_of_total_pct=share,
+                engagement_priority=priority,
+                action=action,
+            ))
+        return ranked
+
+    def _rank_from_entries(self, report: EmissionReport) -> List[SupplierRank]:
+        """Aggregate Scope 3 entries by supplier_id when no SupplierEmissions objects present."""
+        supplier_totals: Dict[str, float] = {}
+        supplier_entries: Dict[str, List[EmissionEntry]] = {}
+        for e in report.entries:
+            if e.scope == EmissionScope.SCOPE3 and e.supplier_id:
+                supplier_totals[e.supplier_id] = supplier_totals.get(e.supplier_id, 0.0) + e.emissions_kg_co2e
+                supplier_entries.setdefault(e.supplier_id, []).append(e)
+
+        total = sum(supplier_totals.values()) or 1.0
+        ranked = []
+        for i, (sid, total_kg) in enumerate(sorted(supplier_totals.items(), key=lambda x: x[1], reverse=True), 1):
+            entries = supplier_entries[sid]
+            intensities = [e.emissions_kg_co2e / e.activity_amount for e in entries if e.activity_amount > 0]
+            avg_i = sum(intensities) / len(intensities) if intensities else 0.0
+            share = total_kg / total * 100
+            priority = "critical" if share >= 20 else "high" if share >= 10 else "medium" if share >= 5 else "low"
+            action = "Engage for primary data." if share >= 10 else "Use estimation."
+            ranked.append(SupplierRank(i, sid, total_kg, len(entries), avg_i, False, share, priority, action))
+        return ranked
+
+    def top_n(self, report: EmissionReport, n: int = 10) -> List[SupplierRank]:
+        """Return the top-N emitting suppliers."""
+        return self.rank(report)[:n]
+
+    def cumulative_coverage(self, rankings: List[SupplierRank], target_pct: float = 80.0) -> List[SupplierRank]:
+        """Return the minimal set of suppliers covering target_pct% of Scope 3 emissions."""
+        cumulative = 0.0
+        result = []
+        for r in rankings:
+            result.append(r)
+            cumulative += r.share_of_total_pct
+            if cumulative >= target_pct:
+                break
+        return result
+
+    def to_markdown(self, rankings: List[SupplierRank]) -> str:
+        """Render a Markdown supplier ranking table."""
+        lines = ["# Supplier Emission Ranking", "",
+                 "| Rank | Supplier ID | Total t CO2e | Share % | Verified | Priority | Action |",
+                 "|------|-------------|-------------|---------|----------|----------|--------|"]
+        for r in rankings:
+            lines.append(
+                f"| {r.rank} | {r.supplier_id} | {r.total_kg_co2e / 1000:.2f} | "
+                f"{r.share_of_total_pct:.1f}% | {'YES' if r.verified else 'NO'} | "
+                f"{r.engagement_priority.upper()} | {r.action[:60]}… |"
+            )
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPERT: CARBON REDUCTION SCENARIO MODELLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ReductionScenario:
+    """A what-if reduction intervention to model."""
+    name: str
+    scope: str          # "scope1", "scope2", "scope3", "all"
+    category: Optional[str]  # Scope3Category value, or None for all
+    reduction_pct: float     # 0.0 to 1.0
+    cost_estimate_usd: Optional[float] = None
+    description: str = ""
+
+
+@dataclass
+class ScenarioModelResult:
+    """Projected outcome of applying a ReductionScenario."""
+    scenario_name: str
+    baseline_kg_co2e: float
+    projected_kg_co2e: float
+    absolute_reduction_kg: float
+    reduction_pct_achieved: float
+    cost_estimate_usd: Optional[float]
+    cost_per_tonne_co2e: Optional[float]
+    description: str
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "scenario": self.scenario_name,
+            "baseline_t_co2e": round(self.baseline_kg_co2e / 1000, 3),
+            "projected_t_co2e": round(self.projected_kg_co2e / 1000, 3),
+            "reduction_t_co2e": round(self.absolute_reduction_kg / 1000, 3),
+            "reduction_pct": round(self.reduction_pct_achieved * 100, 2),
+            "cost_usd": self.cost_estimate_usd,
+            "cost_per_tonne": round(self.cost_per_tonne_co2e, 2) if self.cost_per_tonne_co2e else None,
+        }
+
+
+class CarbonReductionScenarioModeller:
+    """
+    Model what-if carbon reduction scenarios against an emission report.
+
+    Applies percentage-based reductions to specified scopes and/or Scope 3
+    categories, calculates the projected total emissions, and estimates
+    cost-efficiency ($/t CO2e) when cost data is provided.
+
+    Usage::
+
+        modeller = CarbonReductionScenarioModeller()
+        scenario = ReductionScenario(
+            name="Switch to renewable electricity",
+            scope="scope2",
+            category=None,
+            reduction_pct=1.0,
+            cost_estimate_usd=50000,
+        )
+        result = modeller.model(report, scenario)
+        print(result.summary())
+    """
+
+    def model(self, report: EmissionReport, scenario: ReductionScenario) -> ScenarioModelResult:
+        """Apply one reduction scenario to an EmissionReport."""
+        baseline = report.total_kg_co2e
+        reduction_kg = self._compute_reduction(report, scenario)
+        projected = max(0.0, baseline - reduction_kg)
+        pct_achieved = reduction_kg / baseline if baseline > 0 else 0.0
+
+        cost_per_tonne: Optional[float] = None
+        if scenario.cost_estimate_usd and reduction_kg > 0:
+            cost_per_tonne = scenario.cost_estimate_usd / (reduction_kg / 1000)
+
+        return ScenarioModelResult(
+            scenario_name=scenario.name,
+            baseline_kg_co2e=baseline,
+            projected_kg_co2e=projected,
+            absolute_reduction_kg=reduction_kg,
+            reduction_pct_achieved=pct_achieved,
+            cost_estimate_usd=scenario.cost_estimate_usd,
+            cost_per_tonne_co2e=cost_per_tonne,
+            description=scenario.description,
+        )
+
+    def _compute_reduction(self, report: EmissionReport, scenario: ReductionScenario) -> float:
+        """Compute absolute reduction in kg CO2e for a scenario."""
+        scope = scenario.scope
+        category = scenario.category
+        pct = scenario.reduction_pct
+
+        if scope == "scope1":
+            return report.scope1_kg_co2e * pct
+        if scope == "scope2":
+            return report.scope2_kg_co2e * pct
+        if scope == "scope3":
+            if category:
+                cat_total = sum(
+                    e.emissions_kg_co2e for e in report.entries
+                    if e.scope == EmissionScope.SCOPE3 and e.category and e.category.value == category
+                )
+                return cat_total * pct
+            return report.scope3_kg_co2e * pct
+        # "all"
+        return report.total_kg_co2e * pct
+
+    def compare_scenarios(
+        self,
+        report: EmissionReport,
+        scenarios: List[ReductionScenario],
+    ) -> List[Dict[str, Any]]:
+        """Run multiple scenarios and return a sorted comparison (best reduction first)."""
+        results = [self.model(report, s) for s in scenarios]
+        return sorted([r.summary() for r in results], key=lambda x: x["reduction_t_co2e"], reverse=True)
+
+    def to_markdown(self, results: List[Dict[str, Any]]) -> str:
+        """Render scenario comparison as Markdown."""
+        lines = ["# Carbon Reduction Scenario Modelling", "",
+                 "| Scenario | Baseline t | Projected t | Reduction t | Reduction % | $/t CO2e |",
+                 "|----------|-----------|------------|------------|-------------|---------|"]
+        for r in results:
+            cpt = f"${r['cost_per_tonne']:.2f}" if r["cost_per_tonne"] else "—"
+            lines.append(
+                f"| {r['scenario']} | {r['baseline_t_co2e']:.1f} | {r['projected_t_co2e']:.1f} | "
+                f"{r['reduction_t_co2e']:.3f} | {r['reduction_pct']:.1f}% | {cpt} |"
+            )
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPERT: EMISSION SPAN EMITTER (OpenTelemetry with stdlib fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EmissionSpanEmitter:
+    """
+    Emit OpenTelemetry spans for emission calculation operations.
+    Falls back to structured logging when opentelemetry-sdk is not installed.
+    """
+
+    def __init__(self, service_name: str = "scope3track") -> None:
+        self._service = service_name
+        self._otel_available = False
+        self._tracer: Any = None
+        try:
+            from opentelemetry import trace
+            from opentelemetry.sdk.trace import TracerProvider
+            provider = TracerProvider()
+            trace.set_tracer_provider(provider)
+            self._tracer = trace.get_tracer(service_name)
+            self._otel_available = True
+            logger.debug("EmissionSpanEmitter: OpenTelemetry tracer initialised")
+        except ImportError:
+            logger.debug("EmissionSpanEmitter: opentelemetry not installed — using log fallback")
+
+    def span(self, operation: str, attributes: Optional[Dict[str, Any]] = None) -> Any:
+        """Context manager: emit an OTEL span or log span start/end."""
+        if self._otel_available and self._tracer is not None:
+            span = self._tracer.start_span(operation)
+            if attributes:
+                for k, v in attributes.items():
+                    span.set_attribute(k, str(v))
+            return span
+        return _LogSpan(operation, attributes or {}, self._service)
+
+    def emit_entry(self, entry: EmissionEntry) -> None:
+        """Emit a span for a single emission entry calculation."""
+        attrs = {
+            "entry_id": entry.entry_id,
+            "scope": entry.scope.value,
+            "emissions_kg_co2e": entry.emissions_kg_co2e,
+            "source": entry.source,
+        }
+        with self.span("scope3track.emission_calculated", attrs):
+            pass
+
+    def emit_report(self, report: EmissionReport) -> None:
+        """Emit a span summarising a full emission report."""
+        attrs = {
+            "company_id": report.company_id,
+            "reporting_year": report.reporting_year,
+            "total_t_co2e": report.total_t_co2e,
+            "entry_count": len(report.entries),
+        }
+        with self.span("scope3track.report_generated", attrs):
+            pass
+
+
+class _LogSpan:
+    """Stdlib-logging fallback span used when OTEL is unavailable."""
+
+    def __init__(self, name: str, attrs: Dict[str, Any], service: str) -> None:
+        self._name = name
+        self._attrs = attrs
+        self._service = service
+        self._t0 = time.monotonic()
+
+    def __enter__(self) -> "_LogSpan":
+        logger.debug("[span:start] service=%s operation=%s attrs=%s", self._service, self._name, self._attrs)
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        elapsed = round((time.monotonic() - self._t0) * 1000, 2)
+        logger.debug("[span:end] service=%s operation=%s elapsed_ms=%s", self._service, self._name, elapsed)
