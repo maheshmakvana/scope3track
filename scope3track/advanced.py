@@ -929,3 +929,334 @@ class _LogSpan:
     def __exit__(self, *args: Any) -> None:
         elapsed = round((time.monotonic() - self._t0) * 1000, 2)
         logger.debug("[span:end] service=%s operation=%s elapsed_ms=%s", self._service, self._name, elapsed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPERT v1.2.0: EMISSION HOTSPOT ANALYZER
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class EmissionHotspot:
+    """A high-emission source identified from an EmissionReport."""
+    rank: int
+    source: str
+    category: Optional[str]   # Scope3Category value or None
+    scope: str
+    total_kg_co2e: float
+    share_pct: float
+    cumulative_pct: float
+    entry_count: int
+    avg_intensity: float      # kg CO2e per unit of activity
+    priority: str             # "critical", "high", "medium", "low"
+    action: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rank": self.rank,
+            "source": self.source,
+            "scope": self.scope,
+            "category": self.category,
+            "total_t_co2e": round(self.total_kg_co2e / 1000, 3),
+            "share_pct": round(self.share_pct, 2),
+            "priority": self.priority,
+            "action": self.action,
+        }
+
+
+class EmissionHotspotAnalyzer:
+    """
+    Identify the highest-emission sources across scopes and Scope 3 categories.
+
+    Aggregates EmissionEntries by source description, computes each source's
+    share of total portfolio emissions, and classifies them by abatement priority.
+    Supports Pareto (80/20) filtering to focus reduction efforts on the largest
+    contributors first.
+
+    Usage::
+
+        analyzer = EmissionHotspotAnalyzer()
+        hotspots = analyzer.analyze(report)
+        print(analyzer.to_markdown(hotspots))
+        top80 = analyzer.pareto(hotspots)   # sources covering 80% of emissions
+    """
+
+    _PRIORITY_THRESHOLDS = (20.0, 10.0, 5.0)  # % share → critical / high / medium
+
+    _SCOPE_ACTIONS: Dict[str, str] = {
+        "scope1": "Fuel-switch to renewable energy or electrification; retrofit combustion equipment.",
+        "scope2": "Procure 100% renewable electricity certificates (RECs/GOs); install on-site solar.",
+        "scope3": "Engage supplier for primary emission data; set joint reduction target.",
+    }
+
+    def analyze(self, report: EmissionReport) -> List[EmissionHotspot]:
+        """Aggregate entries by source and return ranked hotspots."""
+        from collections import defaultdict
+        source_kg: Dict[str, float] = defaultdict(float)
+        source_entries: Dict[str, List[EmissionEntry]] = defaultdict(list)
+
+        for entry in report.entries:
+            source_kg[entry.source] += entry.emissions_kg_co2e
+            source_entries[entry.source].append(entry)
+
+        total = sum(source_kg.values()) or 1.0
+        sorted_sources = sorted(source_kg.items(), key=lambda x: x[1], reverse=True)
+        cumulative = 0.0
+        hotspots: List[EmissionHotspot] = []
+
+        for rank, (source, kg) in enumerate(sorted_sources, 1):
+            share = kg / total * 100
+            cumulative += share
+            entries = source_entries[source]
+
+            scope = entries[0].scope.value if entries else "scope3"
+            category = entries[0].scope3_category.value if entries and entries[0].scope3_category else None
+            intensities = [e.emissions_kg_co2e / e.activity_amount for e in entries if e.activity_amount > 0]
+            avg_i = sum(intensities) / len(intensities) if intensities else 0.0
+
+            if share >= self._PRIORITY_THRESHOLDS[0]:
+                priority = "critical"
+            elif share >= self._PRIORITY_THRESHOLDS[1]:
+                priority = "high"
+            elif share >= self._PRIORITY_THRESHOLDS[2]:
+                priority = "medium"
+            else:
+                priority = "low"
+
+            action = self._SCOPE_ACTIONS.get(scope, "Review and reduce through efficiency measures.")
+            hotspots.append(EmissionHotspot(
+                rank=rank,
+                source=source,
+                category=category,
+                scope=scope,
+                total_kg_co2e=kg,
+                share_pct=share,
+                cumulative_pct=cumulative,
+                entry_count=len(entries),
+                avg_intensity=avg_i,
+                priority=priority,
+                action=action,
+            ))
+        return hotspots
+
+    def pareto(self, hotspots: List[EmissionHotspot], target_pct: float = 80.0) -> List[EmissionHotspot]:
+        """Return the minimal set of sources covering target_pct of total emissions."""
+        result: List[EmissionHotspot] = []
+        cumulative = 0.0
+        for h in hotspots:
+            result.append(h)
+            cumulative += h.share_pct
+            if cumulative >= target_pct:
+                break
+        return result
+
+    def by_scope(self, hotspots: List[EmissionHotspot], scope: str) -> List[EmissionHotspot]:
+        """Filter hotspots to a specific scope ('scope1', 'scope2', 'scope3')."""
+        return [h for h in hotspots if h.scope == scope]
+
+    def to_markdown(self, hotspots: List[EmissionHotspot]) -> str:
+        """Render a Markdown emission hotspot table."""
+        lines = [
+            "# Emission Hotspot Analysis",
+            "",
+            "| Rank | Source | Scope | t CO2e | Share % | Cumul. % | Priority | Action |",
+            "|------|--------|-------|--------|---------|----------|----------|--------|",
+        ]
+        for h in hotspots:
+            lines.append(
+                f"| {h.rank} | {h.source[:35]} | {h.scope} | "
+                f"{h.total_kg_co2e / 1000:.2f} | {h.share_pct:.1f}% | "
+                f"{h.cumulative_pct:.1f}% | {h.priority.upper()} | "
+                f"{h.action[:50]}… |"
+            )
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPERT v1.2.0: NET ZERO ROADMAP GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class NetZeroMilestone:
+    """A single year milestone on the path to Net Zero."""
+    year: int
+    target_kg_co2e: float
+    required_reduction_from_base_kg: float
+    cumulative_reduction_pct: float
+    key_actions: List[str]
+    offset_needed_kg: float   # residual emissions to offset if abatement alone is insufficient
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "year": self.year,
+            "target_t_co2e": round(self.target_kg_co2e / 1000, 2),
+            "required_reduction_t": round(self.required_reduction_from_base_kg / 1000, 2),
+            "cumulative_reduction_pct": round(self.cumulative_reduction_pct, 1),
+            "key_actions": self.key_actions,
+            "offset_needed_t": round(self.offset_needed_kg / 1000, 2),
+        }
+
+
+@dataclass
+class NetZeroRoadmap:
+    """A complete year-by-year Net Zero roadmap for an organisation."""
+    company_id: str
+    base_year: int
+    target_year: int
+    base_kg_co2e: float
+    pathway: str                # "1.5C", "well_below_2C", "2C"
+    milestones: List[NetZeroMilestone]
+    total_abatement_needed_kg: float
+    feasibility: str            # "achievable", "challenging", "requires_offsets"
+    generated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "company_id": self.company_id,
+            "pathway": self.pathway,
+            "base_year": self.base_year,
+            "target_year": self.target_year,
+            "base_t_co2e": round(self.base_kg_co2e / 1000, 2),
+            "total_abatement_needed_t": round(self.total_abatement_needed_kg / 1000, 2),
+            "feasibility": self.feasibility,
+            "milestone_count": len(self.milestones),
+        }
+
+
+# Typical corporate abatement lever menu, phase-sorted by typical deployment timeline
+_ABATEMENT_LEVERS: List[Dict[str, Any]] = [
+    {"phase": "short",  "action": "Switch to 100% renewable electricity (PPAs/RECs).",           "scope": "scope2"},
+    {"phase": "short",  "action": "Electrify light-duty fleet (replace ICE with EVs).",           "scope": "scope1"},
+    {"phase": "short",  "action": "Implement remote-work / business travel reduction policy.",    "scope": "scope3"},
+    {"phase": "medium", "action": "Retrofit building HVAC with heat pumps and insulation.",       "scope": "scope1"},
+    {"phase": "medium", "action": "Switch manufacturing fuel to green hydrogen or biomethane.",   "scope": "scope1"},
+    {"phase": "medium", "action": "Require top-20 suppliers to set Science-Based Targets.",       "scope": "scope3"},
+    {"phase": "medium", "action": "Redesign products for circularity; reduce packaging weight.",  "scope": "scope3"},
+    {"phase": "long",   "action": "Deploy CCS / CCUS at high-emission industrial processes.",     "scope": "scope1"},
+    {"phase": "long",   "action": "Achieve full supply chain Scope 3 primary data coverage.",     "scope": "scope3"},
+    {"phase": "long",   "action": "Purchase verified carbon offsets for residual hard-to-abate.", "scope": "all"},
+]
+
+
+class NetZeroRoadmapGenerator:
+    """
+    Generate a year-by-year Net Zero roadmap aligned to an SBTi pathway.
+
+    Distributes the required annual reduction trajectory across milestone years
+    and assigns phased abatement levers (short / medium / long term). Identifies
+    residual emissions that must be offset when abatement alone cannot reach zero.
+
+    Usage::
+
+        generator = NetZeroRoadmapGenerator()
+        roadmap = generator.generate(
+            company_id="acme-corp",
+            base_year=2023,
+            target_year=2050,
+            base_kg_co2e=500_000,
+            pathway="1.5C",
+            milestone_years=[2025, 2030, 2035, 2040, 2045, 2050],
+        )
+        print(generator.to_markdown(roadmap))
+    """
+
+    _PATHWAY_RATES: Dict[str, float] = {
+        "1.5C":          0.042,
+        "well_below_2C": 0.025,
+        "2C":            0.018,
+    }
+
+    def generate(
+        self,
+        company_id: str,
+        base_year: int,
+        target_year: int,
+        base_kg_co2e: float,
+        pathway: str = "1.5C",
+        milestone_years: Optional[List[int]] = None,
+    ) -> NetZeroRoadmap:
+        """Generate a Net Zero roadmap for the given parameters."""
+        rate = self._PATHWAY_RATES.get(pathway, 0.042)
+        if milestone_years is None:
+            step = max(1, (target_year - base_year) // 5)
+            milestone_years = list(range(base_year + step, target_year + 1, step))
+            if target_year not in milestone_years:
+                milestone_years.append(target_year)
+
+        milestones: List[NetZeroMilestone] = []
+        for year in sorted(milestone_years):
+            years_elapsed = year - base_year
+            # Compound reduction: target_kg = base * (1 - rate)^years
+            compound_factor = (1.0 - rate) ** years_elapsed
+            target_kg = base_kg_co2e * compound_factor
+            reduction_from_base = base_kg_co2e - target_kg
+            cumulative_pct = (1.0 - compound_factor) * 100
+
+            # Assign levers by phase
+            phase = "short" if years_elapsed <= 5 else "medium" if years_elapsed <= 15 else "long"
+            actions = [
+                lev["action"] for lev in _ABATEMENT_LEVERS
+                if lev["phase"] == phase
+            ][:3]
+
+            # Residual offset needed when approaching target year
+            offset_kg = max(0.0, target_kg * 0.05) if year == target_year else 0.0
+
+            milestones.append(NetZeroMilestone(
+                year=year,
+                target_kg_co2e=target_kg,
+                required_reduction_from_base_kg=reduction_from_base,
+                cumulative_reduction_pct=cumulative_pct,
+                key_actions=actions,
+                offset_needed_kg=offset_kg,
+            ))
+
+        total_abatement = base_kg_co2e - milestones[-1].target_kg_co2e if milestones else 0.0
+        residual = milestones[-1].target_kg_co2e if milestones else base_kg_co2e
+        if residual < base_kg_co2e * 0.10:
+            feasibility = "achievable"
+        elif residual < base_kg_co2e * 0.25:
+            feasibility = "challenging"
+        else:
+            feasibility = "requires_offsets"
+
+        return NetZeroRoadmap(
+            company_id=company_id,
+            base_year=base_year,
+            target_year=target_year,
+            base_kg_co2e=base_kg_co2e,
+            pathway=pathway,
+            milestones=milestones,
+            total_abatement_needed_kg=total_abatement,
+            feasibility=feasibility,
+        )
+
+    def to_markdown(self, roadmap: NetZeroRoadmap) -> str:
+        """Render a full Markdown Net Zero roadmap report."""
+        s = roadmap.summary()
+        lines = [
+            f"# Net Zero Roadmap — {roadmap.company_id}",
+            f"**Pathway**: {roadmap.pathway}  |  "
+            f"**Base Year**: {roadmap.base_year} ({s['base_t_co2e']:.0f} t CO2e)  |  "
+            f"**Target Year**: {roadmap.target_year}  |  "
+            f"**Feasibility**: {roadmap.feasibility.replace('_', ' ').upper()}",
+            "",
+            "## Year-by-Year Milestones",
+            "",
+            "| Year | Target t CO2e | Reduction from Base | Cumul. % | Offset Needed t |",
+            "|------|--------------|---------------------|----------|-----------------|",
+        ]
+        for m in roadmap.milestones:
+            lines.append(
+                f"| {m.year} | {m.target_kg_co2e / 1000:.1f} | "
+                f"{m.required_reduction_from_base_kg / 1000:.1f} t | "
+                f"{m.cumulative_reduction_pct:.1f}% | "
+                f"{m.offset_needed_kg / 1000:.1f} |"
+            )
+        lines += ["", "## Key Actions by Milestone", ""]
+        for m in roadmap.milestones:
+            if m.key_actions:
+                lines.append(f"### {m.year}")
+                for action in m.key_actions:
+                    lines.append(f"- {action}")
+                lines.append("")
+        return "\n".join(lines)

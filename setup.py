@@ -5,9 +5,9 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="scope3track",
-    version="1.0.1",
+    version="1.2.0",
     author="",
-    description="Carbon and Scope 3 emissions tracking for SMBs — GHG Protocol compliant calculations, supplier tracking, CSRD-ready reporting",
+    description="Carbon and Scope 3 emissions tracking — GHG Protocol, emission hotspot analysis, Net Zero roadmap generation, SBTi alignment, CSRD-ready reporting",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/scope3track-py/scope3track",
@@ -33,6 +33,9 @@ setup(
         "CSRD compliance", "carbon footprint calculator",
         "scope3 reporting", "sustainability reporting",
         "carbon accounting SMB", "emission factor calculation",
-        "supply chain emissions tracking",
+        "supply chain emissions tracking", "net zero roadmap python",
+        "emission hotspot analysis", "SBTi alignment checker python",
+        "Science Based Targets python", "carbon reduction scenarios",
+        "net zero planning tool python", "CSRD reporting tool",
     ],
 )

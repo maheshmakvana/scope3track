@@ -25,12 +25,17 @@ from scope3track.advanced import (
     EmissionCache,
     EmissionDiff,
     EmissionDriftDetector,
+    EmissionHotspot,
+    EmissionHotspotAnalyzer,
     EmissionPipeline,
     EmissionProfiler,
     EmissionReportExporter,
     EmissionRule,
     EmissionSpanEmitter,
     EmissionValidator,
+    NetZeroMilestone,
+    NetZeroRoadmap,
+    NetZeroRoadmapGenerator,
     PIIScrubber,
     RateLimiter,
     ReductionScenario,
@@ -46,7 +51,7 @@ from scope3track.advanced import (
     stream_entries,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     # Core
     "EmissionCalculator",
@@ -81,7 +86,7 @@ __all__ = [
     "diff_entries",
     "AuditLog",
     "PIIScrubber",
-    # Advanced — expert
+    # Advanced — expert v1.1.0
     "SBTiAlignmentChecker",
     "SBTiAlignmentResult",
     "SupplierEmissionRanker",
@@ -90,4 +95,10 @@ __all__ = [
     "ReductionScenario",
     "ScenarioModelResult",
     "EmissionSpanEmitter",
+    # Advanced — expert v1.2.0
+    "EmissionHotspotAnalyzer",
+    "EmissionHotspot",
+    "NetZeroRoadmapGenerator",
+    "NetZeroRoadmap",
+    "NetZeroMilestone",
 ]
