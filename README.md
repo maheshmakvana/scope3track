@@ -174,6 +174,22 @@ for line in entries_to_ndjson(entries):
 - EU CSRD / ESRS E1
 - ISO 14064-1
 
+## Changelog
+
+### v1.2.1 (2026-04-10)
+- Added Changelog section to README for release traceability
+
+### v1.2.0
+- Added `EmissionHotspotAnalyzer` — identify top emission contributors across supply chain tiers
+- Added `NetZeroRoadmapGenerator` — generate phased net-zero reduction roadmaps with milestones
+- Expanded SEO keywords for PyPI discoverability
+
+### v1.0.1
+- Advanced features: pipeline, caching, validation, diff/trend, streaming, audit log
+
+### v1.0.0
+- Initial release: Scope 3 emissions tracking, GHG Protocol calculations, supplier-level reporting
+
 ## License
 
 MIT
